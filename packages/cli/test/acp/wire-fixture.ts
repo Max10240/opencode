@@ -28,7 +28,7 @@ import {
   type TokenUsageInfo,
 } from "@opencode/client/promise"
 import type { BunRequest } from "bun"
-import { Option, Schema } from "effect"
+import { Effect, Exit, Logger, Option, Schema, Scope } from "effect"
 import { ACP } from "../../src/acp/agent"
 
 type DurableEvent = Extract<OpenCodeEvent, { durable: unknown }>
@@ -377,9 +377,16 @@ export async function startWire(options: WireOptions = {}) {
 
   const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
   const agentToClient = new TransformStream<Uint8Array, Uint8Array>()
-  const agentConnection = ACP.connect(
-    OpenCode.make({ baseUrl: server.url }),
-    ndJsonStream(agentToClient.writable, clientToAgent.readable),
+  const logs: Array<Pick<Logger.Options<unknown>, "message" | "cause">> = []
+  const agentScope = Scope.makeUnsafe()
+  const agentConnection = await Effect.runPromise(
+    ACP.connect(
+      OpenCode.make({ baseUrl: server.url }),
+      ndJsonStream(agentToClient.writable, clientToAgent.readable),
+    ).pipe(
+      Scope.provide(agentScope),
+      Effect.provide(Logger.layer([Logger.make((log) => logs.push({ message: log.message, cause: log.cause }))])),
+    ),
   )
   const clientStream = ndJsonStream(clientToAgent.writable, agentToClient.readable)
   const connection = client({ name: "test" })
@@ -456,6 +463,7 @@ export async function startWire(options: WireOptions = {}) {
 
   return {
     server,
+    logs,
     received,
     updates,
     permissions,
@@ -478,6 +486,7 @@ export async function startWire(options: WireOptions = {}) {
     async [Symbol.asyncDispose]() {
       connection.close()
       agentConnection.close()
+      await Effect.runPromise(Scope.close(agentScope, Exit.void))
       await server.stop()
     },
   }

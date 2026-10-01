@@ -1,52 +1,110 @@
-import { agent, RequestError, type Stream } from "@agentclientprotocol/sdk"
+import {
+  agent,
+  RequestError,
+  type AgentHandlerContext,
+  type AgentNotificationHandlersByMethod,
+  type AgentNotificationMethod,
+  type AgentRequestHandlersByMethod,
+  type AgentRequestMethod,
+  type Stream,
+} from "@agentclientprotocol/sdk"
 import type { OpenCodeClient } from "@opencode/client/promise"
-import { ACPConnection } from "./connection"
+import { Cause, Deferred, Effect, type Scope } from "effect"
+import { ACPCatalog } from "./catalog"
 import { ACPError } from "./error"
 import { ACPService } from "./service"
 
-export function connect(client: OpenCodeClient, stream: Stream) {
-  const connection = agent({ name: "opencode" })
-    .onRequest("initialize", (ctx) => run(service.initialize(ctx.params)))
-    .onRequest("authenticate", (ctx) => run(service.authenticate(ctx.params)))
-    .onRequest("session/new", (ctx) => run(service.newSession(ctx.params)))
-    .onRequest("session/load", (ctx) => run(service.loadSession(ctx.params)))
-    .onRequest("session/list", (ctx) => run(service.listSessions(ctx.params)))
-    .onRequest("session/delete", (ctx) => run(service.deleteSession(ctx.params)))
-    .onRequest("session/resume", (ctx) => run(service.resumeSession(ctx.params)))
-    .onRequest("session/close", (ctx) => run(service.closeSession(ctx.params)))
-    .onRequest("session/fork", (ctx) => run(service.forkSession(ctx.params)))
-    .onRequest("session/set_config_option", (ctx) => run(service.setSessionConfigOption(ctx.params)))
-    .onRequest("session/set_mode", (ctx) => run(service.setSessionMode(ctx.params)))
-    .onRequest("session/prompt", (ctx) => run(service.prompt(ctx.params, ctx.signal)))
-    .onNotification("session/cancel", (ctx) => run(service.cancel(ctx.params)))
-    .connect(stream)
-  // Inbound dispatch starts after the stream's async read loop yields, so handlers never observe this before assignment.
-  const service = ACPService.make({ client, connection: ACPConnection.make(connection) })
-  return connection
-}
+// Untraced so request spans parent to the caller's span instead of a setup span that has already ended.
+export const connect = Effect.fnUntraced(function* (client: OpenCodeClient, stream: Stream) {
+  const run = Effect.runPromiseWith(yield* Effect.context<Scope.Scope>())
+  const catalog = yield* ACPCatalog.make(client)
+  // Requests can dispatch once the stream's read loop yields, which may be before the service below is built.
+  const ready = yield* Deferred.make<ACPService.Interface>()
+  const handle =
+    <Params, A>(
+      call: (service: ACPService.Interface, ctx: AgentHandlerContext<Params>) => Effect.Effect<A, ACPService.Failure>,
+    ) =>
+    (name: string) => {
+      const handler = Effect.fn(name)(
+        (ctx: AgentHandlerContext<Params>) =>
+          Deferred.await(ready).pipe(Effect.flatMap((service) => call(service, ctx))),
+        // Catalog failures arrive typed and are classified like promise rejections.
+        Effect.catch(ACPError.classify),
+        Effect.mapError((error) => (error instanceof RequestError ? error : ACPError.toRequestError(error))),
+        Effect.tapCauseIf(Cause.hasDies, (cause) => Effect.logError("ACP request failed", cause)),
+        Effect.catchDefect((defect) => Effect.fail(ACPError.toRequestError(ACPError.fromUnknown(defect)))),
+      )
+      return (ctx: AgentHandlerContext<Params>) => run(handler(ctx))
+    }
+  const app = agent({ name: "opencode" })
+  const request = <Method extends AgentRequestMethod>(
+    method: Method,
+    make: (name: string) => AgentRequestHandlersByMethod[Method],
+  ) => app.onRequest(method, make(spanName(method)))
+  const notification = <Method extends AgentNotificationMethod>(
+    method: Method,
+    make: (name: string) => AgentNotificationHandlersByMethod[Method],
+  ) => app.onNotification(method, make(spanName(method)))
 
-async function run<A>(promise: Promise<A>) {
-  try {
-    return await promise
-  } catch (error) {
-    if (error instanceof RequestError) throw error
-    if (isACPError(error)) throw ACPError.toRequestError(error)
-    throw ACPError.toRequestError(ACPError.fromUnknown(error))
-  }
-}
-
-function isACPError(error: unknown): error is ACPError.Error {
-  return (
-    error instanceof ACPError.SessionNotFoundError ||
-    error instanceof ACPError.SessionDirectoryMismatchError ||
-    error instanceof ACPError.InvalidConfigOptionError ||
-    error instanceof ACPError.InvalidModelError ||
-    error instanceof ACPError.InvalidEffortError ||
-    error instanceof ACPError.InvalidModeError ||
-    error instanceof ACPError.AuthRequiredError ||
-    error instanceof ACPError.UnknownAuthMethodError ||
-    error instanceof ACPError.ServiceFailureError
+  request(
+    "initialize",
+    handle((service, ctx) => service.initialize(ctx.params)),
   )
-}
+  request(
+    "authenticate",
+    handle((service, ctx) => service.authenticate(ctx.params)),
+  )
+  request(
+    "session/new",
+    handle((service, ctx) => service.newSession(ctx.params)),
+  )
+  request(
+    "session/load",
+    handle((service, ctx) => service.loadSession(ctx.params)),
+  )
+  request(
+    "session/list",
+    handle((service, ctx) => service.listSessions(ctx.params)),
+  )
+  request(
+    "session/delete",
+    handle((service, ctx) => service.deleteSession(ctx.params)),
+  )
+  request(
+    "session/resume",
+    handle((service, ctx) => service.resumeSession(ctx.params)),
+  )
+  request(
+    "session/close",
+    handle((service, ctx) => ACPError.promise(() => service.closeSession(ctx.params))),
+  )
+  request(
+    "session/fork",
+    handle((service, ctx) => service.forkSession(ctx.params)),
+  )
+  request(
+    "session/set_config_option",
+    handle((service, ctx) => service.setSessionConfigOption(ctx.params)),
+  )
+  request(
+    "session/set_mode",
+    handle((service, ctx) => service.setSessionMode(ctx.params)),
+  )
+  // The SDK signal is passed through rather than interrupting the fiber: a cancelled turn still resolves with
+  // `stopReason: "cancelled"`.
+  request(
+    "session/prompt",
+    handle((service, ctx) => ACPError.promise(() => service.prompt(ctx.params, ctx.signal))),
+  )
+  notification(
+    "session/cancel",
+    handle((service, ctx) => ACPError.promise(() => service.cancel(ctx.params))),
+  )
+  const connection = app.connect(stream)
+  yield* Deferred.succeed(ready, yield* ACPService.make({ client, connection, catalog, run }))
+  return connection
+})
+
+const spanName = (method: string) => `cli.acp.${method.replaceAll("/", ".")}`
 
 export * as ACP from "./agent"

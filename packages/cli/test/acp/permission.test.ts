@@ -89,12 +89,7 @@ describe("acp permissions over the wire", () => {
           id,
           permissionAsked(sessionID, "perm_external", {
             action: "external_directory",
-            metadata: {
-              command: "mkdir -p /tmp/outside",
-              description: "Create external directory",
-              directories: ["/tmp/outside"],
-              patterns: ["/tmp/outside/*"],
-            },
+            metadata: { filepath: "/tmp/outside/a.ts", parentDir: "/tmp/outside" },
           }),
         ),
       permission: allowOnce,
@@ -103,14 +98,9 @@ describe("acp permissions over the wire", () => {
     await acp.prompt(acp.sessionId, "hello")
 
     expect(acp.permissions[0]?.toolCall).toMatchObject({
-      title: "Create external directory",
-      locations: [{ path: "/tmp/outside" }],
-      rawInput: {
-        command: "mkdir -p /tmp/outside",
-        description: "Create external directory",
-        directories: ["/tmp/outside"],
-        patterns: ["/tmp/outside/*"],
-      },
+      title: "/tmp/outside",
+      locations: [{ path: "/tmp/outside/a.ts" }],
+      rawInput: { filepath: "/tmp/outside/a.ts", parentDir: "/tmp/outside" },
     })
   })
 
@@ -263,8 +253,8 @@ describe("acp permissions over the wire", () => {
   })
 })
 
-describe("acp edit previews and client file sync over the wire", () => {
-  test("previews edits during approval and syncs the completed file", async () => {
+describe("acp edit previews over the wire", () => {
+  test("previews edits during approval", async () => {
     await using dir = await tmpdir()
     const file = path.join(dir.path, "file.ts")
     await fs.writeFile(file, "before")
@@ -287,7 +277,7 @@ describe("acp edit previews and client file sync over the wire", () => {
       },
       permission: allowOnce,
     })
-    await acp.initialize({ writeTextFile: true })
+    await acp.initialize()
     const session = await acp.newSession(dir.path)
 
     await acp.prompt(session.sessionId, "hello")
@@ -295,13 +285,12 @@ describe("acp edit previews and client file sync over the wire", () => {
     expect(acp.permissions[0]?.toolCall).toMatchObject({
       title: "file.ts",
       kind: "edit",
-      locations: [{ path: "file.ts" }],
-      content: [{ type: "diff", path: "file.ts", oldText: "before", newText: "after" }],
+      locations: [{ path: file }],
+      content: [{ type: "diff", path: file, oldText: "before", newText: "after" }],
     })
-    expect(acp.writes).toEqual([{ sessionId: session.sessionId, path: file, content: "after" }])
   })
 
-  test("previews and syncs each file in a patch", async () => {
+  test("previews each file in a patch", async () => {
     await using dir = await tmpdir()
     await Promise.all([
       fs.writeFile(path.join(dir.path, "first.ts"), "one\n"),
@@ -341,7 +330,7 @@ describe("acp edit previews and client file sync over the wire", () => {
       },
       permission: allowOnce,
     })
-    await acp.initialize({ writeTextFile: true })
+    await acp.initialize()
     const session = await acp.newSession(dir.path)
 
     await acp.prompt(session.sessionId, "hello")
@@ -349,36 +338,96 @@ describe("acp edit previews and client file sync over the wire", () => {
     expect(acp.permissions[0]?.toolCall).toMatchObject({
       title: "2 files",
       kind: "edit",
-      locations: [{ path: "first.ts" }, { path: "second.ts" }],
+      locations: [{ path: path.join(dir.path, "first.ts") }, { path: path.join(dir.path, "second.ts") }],
       content: [
-        { type: "diff", path: "first.ts", oldText: "one\n", newText: "two\n" },
-        { type: "diff", path: "second.ts", oldText: "alpha\n", newText: "beta\n" },
+        { type: "diff", path: path.join(dir.path, "first.ts"), oldText: "one\n", newText: "two\n" },
+        { type: "diff", path: path.join(dir.path, "second.ts"), oldText: "alpha\n", newText: "beta\n" },
       ],
     })
-    expect(acp.writes.toSorted((a, b) => a.path.localeCompare(b.path))).toEqual([
-      { sessionId: session.sessionId, path: path.join(dir.path, "first.ts"), content: "two\n" },
-      { sessionId: session.sessionId, path: path.join(dir.path, "second.ts"), content: "beta\n" },
+  })
+
+  test("reports the same absolute locations for a moved file in the permission and tool updates", async () => {
+    await using dir = await tmpdir()
+    await fs.writeFile(path.join(dir.path, "old.ts"), "one\n")
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: old.ts",
+      "*** Move to: new.ts",
+      "@@",
+      "-one",
+      "+two",
+      "*** End Patch",
+    ].join("\n")
+    await using acp = await startWire({
+      onPrompt: ({ sessionID, id }) => [
+        delivered(sessionID, id),
+        toolStarted(sessionID, "call_move", "patch"),
+        toolCalled(sessionID, "call_move", { patchText }),
+        permissionAsked(sessionID, "perm_move", {
+          action: "edit",
+          source: { type: "tool", messageID: "msg_move", id: "call_move" },
+        }),
+      ],
+      onPermissionReply: ({ sessionID }) => [
+        toolSucceeded(sessionID, "call_move", {}, "patched"),
+        succeeded(sessionID),
+      ],
+      permission: allowOnce,
+    })
+    await acp.initialize()
+    const session = await acp.newSession(dir.path)
+
+    await acp.prompt(session.sessionId, "hello")
+
+    const locations = [{ path: path.join(dir.path, "old.ts") }, { path: path.join(dir.path, "new.ts") }]
+    expect(acp.permissions[0]?.toolCall).toMatchObject({
+      locations,
+      content: [{ type: "diff", path: path.join(dir.path, "new.ts"), oldText: "one\n", newText: "two\n" }],
+    })
+    expect(
+      acp.updates.flatMap((item) =>
+        item.update.sessionUpdate === "tool_call_update" && item.update.toolCallId === "call_move"
+          ? [[item.update.status, item.update.locations]]
+          : [],
+      ),
+    ).toEqual([
+      ["in_progress", locations],
+      ["completed", locations],
     ])
   })
 
-  test("does not sync edits when the client did not advertise writeTextFile", async () => {
+  test("does not echo completed edits to a client that advertises writeTextFile", async () => {
     await using dir = await tmpdir()
-    await fs.writeFile(path.join(dir.path, "file.ts"), "after")
+    const file = path.join(dir.path, "file.ts")
+    await fs.writeFile(file, "after")
     await using acp = await startWire({
       onPrompt: ({ sessionID, id }) =>
         turn(
           sessionID,
           id,
           toolStarted(sessionID, "call_edit", "edit"),
-          toolCalled(sessionID, "call_edit", { filePath: path.join(dir.path, "file.ts") }),
-          toolSucceeded(sessionID, "call_edit", {}, "edited"),
+          toolCalled(sessionID, "call_edit", { filePath: file, oldString: "before", newString: "after" }),
+          toolSucceeded(sessionID, "call_edit", { files: [{ file }] }, "edited"),
         ),
     })
-    await acp.initialize()
+    await acp.initialize({ writeTextFile: true })
     const session = await acp.newSession(dir.path)
 
     expect(await acp.prompt(session.sessionId, "hello")).toMatchObject({ stopReason: "end_turn" })
     expect(acp.writes).toEqual([])
+    expect(
+      acp.updates.flatMap((item) =>
+        item.update.sessionUpdate === "tool_call_update" && item.update.status === "completed" ? [item.update] : [],
+      ),
+    ).toMatchObject([
+      {
+        toolCallId: "call_edit",
+        content: [
+          { type: "content", content: { type: "text", text: "edited" } },
+          { type: "diff", path: file, oldText: "before", newText: "after" },
+        ],
+      },
+    ])
   })
 })
 
