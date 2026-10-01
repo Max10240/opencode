@@ -147,7 +147,7 @@ describe("Anthropic Messages effort updates", () => {
     }),
   )
 
-  it.effect("accepts a marker between a tool call and its result", () =>
+  it.effect("moves a marker between a tool call and its result after the result", () =>
     Effect.gen(function* () {
       const prepared = yield* compileRequest(
         LLM.request({
@@ -166,8 +166,8 @@ describe("Anthropic Messages effort updates", () => {
       expect(prepared.body.messages).toEqual([
         { role: "user", content: [{ type: "text", text: "Weather?" }] },
         { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "lookup", input: {} }] },
-        { role: "system", content: [], output_config: { effort: "low" } },
         { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: '{"temp":72}' }] },
+        { role: "system", content: [], output_config: { effort: "low" } },
       ])
     }),
   )
@@ -351,11 +351,48 @@ describe("OpenAI Responses effort updates", () => {
     }),
   )
 
+  it.effect("strips markers when the body overlay selects pro reasoning mode", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model: OpenAI.configure({ apiKey: "fixture", http: { body: { reasoning: { mode: "pro" } } } }).responses(
+            "gpt-6-sol",
+          ),
+          messages: conversation,
+          providerOptions: { reasoningEffort: "low" },
+        }),
+      )
+
+      expect(updates(prepared.body)).toEqual([])
+      expect(prepared.body.reasoning).toEqual({ effort: "low" })
+    }),
+  )
+
   for (const [id, supported] of [
     ["gpt-6-astra", true],
     ["openai/gpt-6-astra", true],
-    ["gpt-6-astra-2026-09-01", false],
+    ["gpt-6-sol", true],
+    ["openai/gpt-6-sol", true],
+    ["gpt-6-luna", true],
+    ["openai/gpt-6-luna", true],
+    ["gpt-6", true],
+    ["gpt-6.1-sol", true],
+    ["openai/gpt-6.1-sol", true],
+    ["GPT-6.1-SOL", true],
+    ["gpt-6-astra-2026-09-01", true],
+    ["gpt-6-sol-pro", true],
+    ["gpt-6-luna-pro", true],
+    ["gpt-6-sol-fast", true],
+    ["gpt-7", true],
+    ["openai/gpt-7.2-new-family", true],
+    ["gpt-10.1", true],
+    ["gpt-5", false],
     ["gpt-5.6-sol", false],
+    ["gpt-5.10", false],
+    ["not-gpt-6-sol", false],
+    ["gpt-6foo", false],
+    ["gpt-6.x-sol", false],
+    ["future-model", false],
   ] as const) {
     it.effect(`${supported ? "lowers" : "strips"} markers for ${id}`, () =>
       Effect.gen(function* () {
