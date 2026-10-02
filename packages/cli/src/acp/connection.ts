@@ -1,52 +1,86 @@
 import {
   methods,
-  type AgentConnection,
+  type AgentApp,
+  type AnyMessage,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type JsonRpcId,
   type RequestError,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
-  type SendRequestOptions,
   type SessionNotification,
+  type Stream,
 } from "@agentclientprotocol/sdk"
-import { Context, type Effect } from "effect"
-import { ACPError } from "./error"
+import { Context, Deferred, Effect } from "effect"
+import type { ACPError } from "./error"
+import { ACPPromise } from "./promise"
 
-type Failure = ACPError.Error | RequestError
+/**
+ * Completes once the response to the request being handled is written, so messages sent afterwards follow it.
+ * Interrupts when the request fails. Outside a request it completes immediately.
+ */
+export const Responded = Context.Reference<Effect.Effect<void>>("@opencode/cli/acp/Connection/Responded", {
+  defaultValue: () => Effect.void,
+})
 
 export interface Interface {
-  readonly sessionUpdate: (params: SessionNotification) => Effect.Effect<void, Failure>
-  /** Interrupting the request cancels it on the client. */
-  readonly requestPermission: (params: RequestPermissionRequest) => Effect.Effect<RequestPermissionResponse, Failure>
-  readonly extNotification: (method: string, params: Record<string, unknown>) => Effect.Effect<void, Failure>
+  readonly sessionUpdate: (params: SessionNotification) => Effect.Effect<void, ACPError.Error | RequestError>
+  /** Interruption cancels the client's request. */
+  readonly requestPermission: (
+    params: RequestPermissionRequest,
+  ) => Effect.Effect<RequestPermissionResponse, ACPError.Error | RequestError>
+  readonly extNotification: (
+    method: string,
+    params: Record<string, unknown>,
+  ) => Effect.Effect<void, ACPError.Error | RequestError>
+  /** Interruption cancels the client's request. */
+  readonly createElicitation: (
+    params: CreateElicitationRequest,
+  ) => Effect.Effect<CreateElicitationResponse, ACPError.Error | RequestError>
+  /** Tracks an incoming request from now on and returns its `Responded`. */
+  readonly responded: (requestId: JsonRpcId) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/cli/acp/Connection") {}
 
-export function service(connection: AgentConnection) {
-  return Service.of({
-    sessionUpdate: (params) => ACPError.promise(() => connection.client.notify(methods.client.session.update, params)),
-    requestPermission: (params) =>
-      ACPError.promise((signal) =>
-        connection.client.request(methods.client.session.requestPermission, params, { cancellationSignal: signal }),
-      ),
-    extNotification: (method, params) => ACPError.promise(() => connection.client.notify(method, params)),
+export function make(app: AgentApp, stream: Stream) {
+  // Settled as each response is written to the stream, which serializes every outgoing message.
+  const responses = new Map<JsonRpcId, Deferred.Deferred<void>>()
+  const writer = stream.writable.getWriter()
+  const agent = app.connect({
+    readable: stream.readable,
+    writable: new WritableStream<AnyMessage>({
+      write: async (message) => {
+        await writer.write(message)
+        if ("method" in message) return
+        const responded = responses.get(message.id)
+        if (!responded) return
+        responses.delete(message.id)
+        Deferred.doneUnsafe(responded, "result" in message ? Effect.void : Effect.interrupt)
+      },
+      close: () => writer.close(),
+      abort: (reason) => writer.abort(reason),
+    }),
   })
-}
-
-export type Connection = {
-  readonly signal?: AbortSignal
-  sessionUpdate(params: SessionNotification): Promise<void>
-  requestPermission(params: RequestPermissionRequest, options?: SendRequestOptions): Promise<RequestPermissionResponse>
-  extNotification?(method: string, params: Record<string, unknown>): Promise<void>
-}
-
-/** Promise view for the turn and permission code until they run as effects. */
-export function make(connection: AgentConnection): Connection {
   return {
-    signal: connection.signal,
-    sessionUpdate: (params) => connection.client.notify(methods.client.session.update, params),
-    requestPermission: (params, options) =>
-      connection.client.request(methods.client.session.requestPermission, params, options),
-    extNotification: (method, params) => connection.client.notify(method, params),
+    agent,
+    connection: Service.of({
+      sessionUpdate: (params) => ACPPromise.promise(() => agent.client.notify(methods.client.session.update, params)),
+      requestPermission: (params) =>
+        ACPPromise.promise((signal) =>
+          agent.client.request(methods.client.session.requestPermission, params, { cancellationSignal: signal }),
+        ),
+      extNotification: (method, params) => ACPPromise.promise(() => agent.client.notify(method, params)),
+      createElicitation: (params) =>
+        ACPPromise.promise((signal) =>
+          agent.client.request(methods.client.elicitation.create, params, { cancellationSignal: signal }),
+        ),
+      responded: (requestId) => {
+        const responded = Deferred.makeUnsafe<void>()
+        responses.set(requestId, responded)
+        return Deferred.await(responded)
+      },
+    }),
   }
 }
 

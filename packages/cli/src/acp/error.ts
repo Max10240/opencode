@@ -1,7 +1,5 @@
 import { RequestError } from "@agentclientprotocol/sdk"
-import { ClientError } from "@opencode/client/promise"
-import { Effect, Schema } from "effect"
-import { ACPCatalog } from "./catalog"
+import { Schema } from "effect"
 
 export class SessionNotFoundError extends Schema.TaggedError<SessionNotFoundError>()("ACPSessionNotFoundError", {
   sessionId: Schema.String,
@@ -30,10 +28,20 @@ export class InvalidModeError extends Schema.TaggedError<InvalidModeError>()("AC
   mode: Schema.String,
 }) {}
 
+export class InvalidAdditionalDirectoryError extends Schema.TaggedError<InvalidAdditionalDirectoryError>()(
+  "ACPInvalidAdditionalDirectoryError",
+  { directory: Schema.String },
+) {}
+
 export class AuthRequiredError extends Schema.TaggedError<AuthRequiredError>()("ACPAuthRequiredError", {}) {}
 
 export class UnknownAuthMethodError extends Schema.TaggedError<UnknownAuthMethodError>()("ACPUnknownAuthMethodError", {
   methodId: Schema.String,
+}) {}
+
+export class InvalidRequestError extends Schema.TaggedError<InvalidRequestError>()("ACPInvalidRequestError", {
+  message: Schema.String,
+  field: Schema.optional(Schema.String),
 }) {}
 
 export class ServiceFailureError extends Schema.TaggedError<ServiceFailureError>()("ACPServiceFailureError", {
@@ -54,8 +62,10 @@ const Errors = Schema.Union([
   InvalidModelError,
   InvalidEffortError,
   InvalidModeError,
+  InvalidAdditionalDirectoryError,
   AuthRequiredError,
   UnknownAuthMethodError,
+  InvalidRequestError,
   ServiceFailureError,
   ServerUnavailableError,
 ])
@@ -84,10 +94,17 @@ export function toRequestError(error: Error): RequestError {
       return RequestError.invalidParams({ effort: error.effort }, `effort not found: ${error.effort}`)
     case "ACPInvalidModeError":
       return RequestError.invalidParams({ mode: error.mode }, `mode not found: ${error.mode}`)
+    case "ACPInvalidAdditionalDirectoryError":
+      return RequestError.invalidParams(
+        { additionalDirectory: error.directory },
+        `additional directory must be an absolute path without glob characters: ${error.directory}`,
+      )
     case "ACPAuthRequiredError":
       return RequestError.authRequired({}, "provider authentication required")
     case "ACPUnknownAuthMethodError":
       return RequestError.invalidParams({ methodId: error.methodId }, `unknown auth method: ${error.methodId}`)
+    case "ACPInvalidRequestError":
+      return RequestError.invalidParams(error.field ? { field: error.field } : {}, error.message)
     case "ACPServiceFailureError":
       return RequestError.internalError(
         {
@@ -101,18 +118,6 @@ export function toRequestError(error: Error): RequestError {
   }
   const exhaustive: never = error
   return exhaustive
-}
-
-/** Runs a promise, keeping ACP failures typed. Any other rejection is a defect. */
-export const promise = <A>(evaluate: (signal: AbortSignal) => Promise<A>) =>
-  Effect.tryPromise({ try: evaluate, catch: (cause) => cause }).pipe(Effect.catch(classify))
-
-export function classify(cause: unknown): Effect.Effect<never, Error | RequestError> {
-  // A catalog load failure is classified by the client error that caused it.
-  if (cause instanceof ACPCatalog.LoadError) return classify(cause.cause)
-  if (cause instanceof RequestError || is(cause)) return Effect.fail(cause)
-  if (cause instanceof ClientError && cause.reason === "Transport") return Effect.fail(new ServerUnavailableError())
-  return Effect.die(cause)
 }
 
 export function fromUnknown(error: unknown, service?: string) {

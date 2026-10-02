@@ -1,35 +1,24 @@
 import { isDeepStrictEqual } from "node:util"
 import type { McpServer, RequestError } from "@agentclientprotocol/sdk"
-import type { ModelRef, OpenCodeClient, SessionInfo } from "@opencode/client/promise"
-import { Cause, Context, Effect, Exit, Ref, Scope, Stream } from "effect"
+import type { OpenCodeClient, OpenCodeEvent, SessionInfo } from "@opencode/client/promise"
+import { Context, Deferred, Effect, Exit, Queue, Ref, Scope, Stream } from "effect"
 import type { ACPCatalog, Catalog } from "./catalog"
-import { buildConfigOptions } from "./config-option"
-import type { ACPConnection } from "./connection"
+import { availableCommands, configOptions, type Selection } from "./config-option"
+import { ACPConnection } from "./connection"
 import { ACPError } from "./error"
-
-// ACP runs these itself; they take precedence over server commands with the same name.
-export const builtinCommands = new Map([
-  ["compact", { description: "Compact the session", start: "compaction" as const }],
-])
-
-/** Unset fields follow the server defaults. */
-export type Selection = {
-  readonly model?: ModelRef
-  readonly modeID?: string
-}
+import { ACPPromise } from "./promise"
 
 export type Attached = {
   readonly id: string
   readonly cwd: string
   readonly selection: Ref.Ref<Selection>
-  /** Aborted when the session detaches, for the promise-based turn. */
-  readonly signal: AbortSignal
 }
 
 export interface Interface {
   /**
-   * Attaches a session in its own scope, closing any previous attachment of the same ID. The scope follows the
-   * cwd's catalog and pushes config option and command updates while it is open.
+   * Attaches a session in its own scope, closing any previous attachment of the same ID. Once the attaching request
+   * has responded, the scope follows the cwd's catalog and pushes config option and command updates while it is
+   * open. A failed attach leaves the session detached.
    */
   readonly attach: (
     session: SessionInfo,
@@ -39,9 +28,20 @@ export interface Interface {
   /** Closes the session scope. No-op when the session is not attached. */
   readonly detach: (sessionID: string) => Effect.Effect<void>
   readonly require: (sessionID: string) => Effect.Effect<Attached, ACPError.SessionNotFoundError>
+  /** Forks work into this attachment's scope, so it ends on detach or re-attach. Fails once the attachment is gone. */
+  readonly fork: (attached: Attached, effect: Effect.Effect<void>) => Effect.Effect<void, ACPError.SessionNotFoundError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/cli/acp/Sessions") {}
+
+type Entry = {
+  readonly attached: Attached
+  readonly scope: Scope.Closeable
+  /** Selection changes from other clients, applied by the session's fold. */
+  readonly selected: Queue.Queue<Selection>
+}
+
+type SelectedEvent = Extract<OpenCodeEvent, { type: "session.model.selected" | "session.agent.selected" }>
 
 export const make = Effect.fnUntraced(function* (input: {
   readonly client: OpenCodeClient
@@ -49,27 +49,40 @@ export const make = Effect.fnUntraced(function* (input: {
   readonly catalog: ACPCatalog.Interface
 }) {
   const scope = yield* Effect.scope
-  const sessions = new Map<string, { readonly attached: Attached; readonly scope: Scope.Closeable }>()
+  const sessions = new Map<string, Entry>()
   // Kept across re-attachment so resuming with the same servers does not add them again.
   const registeredMcp = new Map<string, Set<string>>()
+  const connected = yield* Deferred.make<void>()
+
+  // Subscribe before any attach so a switch right after `sessions.set` reaches the session.
+  yield* Stream.fromAsyncIterable(input.client.event.subscribe(), (cause) => cause).pipe(
+    Stream.tap((event) => (event.type === "server.connected" ? Deferred.succeed(connected, undefined) : Effect.void)),
+    Stream.filter(
+      (event): event is SelectedEvent =>
+        event.type === "session.model.selected" || event.type === "session.agent.selected",
+    ),
+    Stream.runForEach((event) => {
+      const entry = sessions.get(event.data.sessionID)
+      if (!entry) return Effect.void
+      return Queue.offer(
+        entry.selected,
+        event.type === "session.model.selected" ? { model: event.data.model } : { modeID: event.data.agent },
+      )
+    }),
+    Effect.ignore,
+    Effect.ensuring(Deferred.succeed(connected, undefined)),
+    Effect.forkScoped,
+  )
 
   const sendCommands = (sessionID: string, catalog: Catalog) =>
     input.connection.sessionUpdate({
       sessionId: sessionID,
-      update: {
-        sessionUpdate: "available_commands_update",
-        availableCommands: [
-          ...catalog.commands
-            .filter((command) => !builtinCommands.has(command.name))
-            .map((command) => ({ name: command.name, description: command.description ?? "" })),
-          ...Array.from(builtinCommands, ([name, command]) => ({ name, description: command.description })),
-        ],
-      },
+      update: { sessionUpdate: "available_commands_update", availableCommands: availableCommands(catalog) },
     })
 
-  const changed = Effect.fnUntraced(function* (attached: Attached, previous: Catalog, next: Catalog) {
-    const selection = yield* Ref.get(attached.selection)
-    const options = configOptions(next, selection)
+  const changed = Effect.fnUntraced(function* (attached: Attached, previous: Catalog, next: Catalog, patch: Selection) {
+    const selection = yield* Ref.getAndUpdate(attached.selection, (current) => ({ ...current, ...patch }))
+    const options = configOptions(next, { ...selection, ...patch })
     if (!isDeepStrictEqual(options, configOptions(previous, selection))) {
       yield* input.connection.sessionUpdate({
         sessionId: attached.id,
@@ -91,81 +104,82 @@ export const make = Effect.fnUntraced(function* (input: {
             const key = `${server.name}:${stableStringify(config)}`
             if (registered.has(key)) return Effect.void
             registered.add(key)
-            return ACPError.promise(() =>
+            return ACPPromise.promise(() =>
               input.client.mcp.add({ server: server.name, location: { directory: attached.cwd }, config }),
             ).pipe(
-              // An interrupted add still completes on the server, so only a failed one is forgotten.
-              Effect.tapCause((cause) =>
-                Cause.hasInterruptsOnly(cause) ? Effect.void : Effect.sync(() => registered.delete(key)),
-              ),
+              Effect.onError(() => Effect.sync(() => registered.delete(key))),
+              Effect.uninterruptible,
             )
           }),
         { concurrency: "unbounded", discard: true },
       )
     })
 
+  const remove = (sessionID: string, entry: Entry) =>
+    Effect.suspend(() => {
+      if (sessions.get(sessionID) === entry) {
+        sessions.delete(sessionID)
+        registeredMcp.delete(sessionID)
+      }
+      return Scope.close(entry.scope, Exit.void)
+    })
+
   return Service.of({
     attach: Effect.fn("cli.acp.sessions.attach")(function* (session, cwd, mcpServers) {
+      yield* Deferred.await(connected)
       const current = yield* input.catalog.get(cwd)
-      const abort = new AbortController()
-      const attached: Attached = {
-        id: session.id,
-        cwd,
-        selection: yield* Ref.make<Selection>({ model: session.model, modeID: session.agent }),
-        signal: abort.signal,
+      const entry: Entry = {
+        attached: {
+          id: session.id,
+          cwd,
+          selection: yield* Ref.make<Selection>({ model: session.model, modeID: session.agent }),
+        },
+        scope: Scope.forkUnsafe(scope),
+        selected: yield* Queue.unbounded<Selection>(),
       }
       // Swap synchronously so concurrent attaches of one ID cannot both keep a scope.
-      const sessionScope = Scope.forkUnsafe(scope)
       const replaced = sessions.get(session.id)
-      sessions.set(session.id, { attached, scope: sessionScope })
+      sessions.set(session.id, entry)
       if (replaced) yield* Scope.close(replaced.scope, Exit.void)
-      yield* Scope.addFinalizer(
-        sessionScope,
-        Effect.sync(() => abort.abort()),
-      )
-      yield* input.catalog.changes(cwd).pipe(
-        Stream.runFoldEffect(
-          () => current,
-          (previous, next) =>
-            next === previous
-              ? Effect.succeed(previous)
-              : changed(attached, previous, next).pipe(Effect.ignore, Effect.as(next)),
-        ),
-        Effect.ignore,
-        Effect.forkIn(sessionScope),
-      )
-      yield* registerMcp(attached, mcpServers)
-      yield* sendCommands(attached.id, yield* input.catalog.get(cwd))
-      return attached
+      yield* registerMcp(entry.attached, mcpServers).pipe(Effect.onError(() => remove(session.id, entry)))
+      const responded = yield* ACPConnection.Responded
+      // Updates wait for the response that hands the client this session. `changes` emits the latest catalog
+      // first, so a reload since `current` is still pushed. One fold applies catalog and selection changes so
+      // pushes leave the client on the latest pair.
+      yield* Effect.gen(function* () {
+        yield* responded
+        yield* sendCommands(session.id, current)
+        yield* Stream.merge(
+          input.catalog.changes(cwd).pipe(Stream.map((catalog) => ({ catalog, patch: {} }))),
+          Stream.fromQueue(entry.selected).pipe(Stream.map((patch) => ({ catalog: undefined, patch }))),
+        ).pipe(
+          Stream.runFoldEffect(
+            () => current,
+            (previous, step) => {
+              const next = step.catalog ?? previous
+              return changed(entry.attached, previous, next, step.patch).pipe(Effect.ignore, Effect.as(next))
+            },
+          ),
+        )
+      }).pipe(Effect.ignore, Effect.forkIn(entry.scope))
+      return entry.attached
     }),
     detach: Effect.fn("cli.acp.sessions.detach")(function* (sessionID) {
       const entry = sessions.get(sessionID)
-      sessions.delete(sessionID)
-      registeredMcp.delete(sessionID)
-      if (entry) yield* Scope.close(entry.scope, Exit.void)
+      if (entry) yield* remove(sessionID, entry)
     }),
     require: Effect.fn("cli.acp.sessions.require")(function* (sessionID) {
       const entry = sessions.get(sessionID)
       if (!entry) return yield* new ACPError.SessionNotFoundError({ sessionId: sessionID })
       return entry.attached
     }),
+    fork: Effect.fn("cli.acp.sessions.fork")(function* (attached, effect) {
+      const entry = sessions.get(attached.id)
+      if (entry?.attached !== attached) return yield* new ACPError.SessionNotFoundError({ sessionId: attached.id })
+      yield* Effect.forkIn(effect, entry.scope, { startImmediately: true })
+    }),
   })
 })
-
-export function currentModel(catalog: Catalog, selection: Selection) {
-  return selection.model ?? catalog.defaultModel
-}
-
-export function configOptions(catalog: Catalog, selection: Selection) {
-  const model = currentModel(catalog, selection)
-  return buildConfigOptions({
-    providers: catalog.providers,
-    currentModel: { providerID: model.providerID, modelID: model.id },
-    currentVariant: model.variant,
-    modes: catalog.modes,
-    currentModeId: selection.modeID ?? catalog.defaultModeID,
-  })
-}
 
 function mcpConfig(server: McpServer) {
   if ("type" in server) {
